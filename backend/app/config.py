@@ -9,7 +9,7 @@ DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Security and Limits: Support large 4K/8K video downloads (up to 30 GB)
 MAX_FILE_SIZE_BYTES = 30 * 1024 * 1024 * 1024  # 30 GB for 8K video support
-MIN_FREE_DISK_BYTES = 5 * 1024 * 1024 * 1024   # 5 GB minimum free space
+MIN_FREE_DISK_BYTES = 500 * 1024 * 1024        # 500 MB minimum free space
 FILE_EXPIRY_SECONDS = 60 * 60  # 1 hour
 CLEANUP_INTERVAL_SECONDS = 10 * 60  # Check every 10 minutes
 
