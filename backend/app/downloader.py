@@ -1,13 +1,22 @@
 import os
+import re
 import time
 import uuid
 import logging
 import threading
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 import yt_dlp
-from app.config import DOWNLOADS_DIR, FFMPEG_PATH, MAX_FILE_SIZE_BYTES
+from app.config import (
+    DOWNLOADS_DIR, 
+    FFMPEG_PATH, 
+    FFPROBE_PATH,
+    NODE_PATH,
+    MAX_FILE_SIZE_BYTES, 
+    MIN_FREE_DISK_BYTES,
+    get_disk_free_space
+)
 from app.security import sanitize_filename, validate_url
 from app.verifier import verify_media_file, ensure_compatible_mp4, VerificationError
 
@@ -26,6 +35,29 @@ def format_bytes(b: Optional[float]) -> str:
         b /= 1024.0
     return f"{b:.1f} TB"
 
+def format_duration(seconds: Optional[int]) -> str:
+    if not seconds:
+        return "00:00"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+def identify_codec(vcodec: Optional[str]) -> str:
+    if not vcodec or vcodec == 'none':
+        return 'Unknown'
+    v = vcodec.lower()
+    if 'av01' in v or 'av1' in v:
+        return 'AV1'
+    if 'vp9' in v or 'vp09' in v:
+        return 'VP9'
+    if 'avc1' in v or 'h264' in v:
+        return 'H.264'
+    if 'hev1' in v or 'hvc1' in v or 'h265' in v:
+        return 'HEVC'
+    return vcodec.split('.')[0].upper()
+
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     with jobs_lock:
         return jobs.get(job_id)
@@ -37,7 +69,8 @@ def update_job(job_id: str, **kwargs) -> None:
 
 def fetch_media_info(url: str) -> Dict[str, Any]:
     """
-    Extracts video metadata and supported formats without downloading.
+    Extracts actual video metadata, real available resolutions (144p to 8K),
+    and available stream codecs using yt-dlp.
     """
     is_valid, err_msg, platform = validate_url(url)
     if not is_valid:
@@ -48,8 +81,12 @@ def fetch_media_info(url: str) -> Dict[str, Any]:
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
-        'socket_timeout': 15,
+        'socket_timeout': 20,
     }
+    if FFMPEG_PATH:
+        ydl_opts['ffmpeg_location'] = os.path.dirname(FFMPEG_PATH) if os.path.isabs(FFMPEG_PATH) else None
+    if NODE_PATH:
+        ydl_opts['js_runtimes'] = {'node': {}}
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -61,31 +98,119 @@ def fetch_media_info(url: str) -> Dict[str, Any]:
                 info = info['entries'][0]
 
             raw_formats = info.get('formats', [])
-            available_heights = set()
+            
+            # Detect audio formats
+            best_audio_size = 0
             for f in raw_formats:
-                h = f.get('height')
-                if h and isinstance(h, int) and h >= 144:
-                    available_heights.add(h)
+                if f.get('vcodec') == 'none' and f.get('acodec') != 'none':
+                    s = f.get('filesize') or f.get('filesize_approx') or 0
+                    if s > best_audio_size:
+                        best_audio_size = s
 
-            sorted_heights = sorted(list(available_heights), reverse=True)
-            
+            # Group video streams by resolution
+            res_groups: Dict[int, Dict[str, Any]] = {}
+            all_codecs = set()
+
+            for f in raw_formats:
+                vcodec = f.get('vcodec')
+                if not vcodec or vcodec == 'none':
+                    continue
+                height = f.get('height')
+                width = f.get('width')
+                if not height or not isinstance(height, int) or height < 140:
+                    continue
+
+                codec_name = identify_codec(vcodec)
+                all_codecs.add(codec_name)
+
+                fps = f.get('fps') or 30
+                filesize = f.get('filesize') or f.get('filesize_approx') or 0
+                dynamic_range = f.get('dynamic_range') or 'SDR'
+
+                if height not in res_groups:
+                    res_groups[height] = {
+                        'height': height,
+                        'width': width or 0,
+                        'max_fps': fps,
+                        'dynamic_range': dynamic_range,
+                        'codecs': set(),
+                        'max_filesize': filesize
+                    }
+                res_groups[height]['codecs'].add(codec_name)
+                if fps > res_groups[height]['max_fps']:
+                    res_groups[height]['max_fps'] = fps
+                if dynamic_range != 'SDR':
+                    res_groups[height]['dynamic_range'] = dynamic_range
+                if filesize > res_groups[height]['max_filesize']:
+                    res_groups[height]['max_filesize'] = filesize
+
+            # Build cleanly sorted resolutions
+            available_resolutions = []
+            has_8k = False
+            has_4k = False
+            has_hdr = False
+
+            for h in sorted(res_groups.keys(), reverse=True):
+                grp = res_groups[h]
+                if h >= 4320:
+                    has_8k = True
+                    tier = "8K Ultra HD"
+                    res_tag = "4320p"
+                elif h >= 2160:
+                    has_4k = True
+                    tier = "4K Ultra HD"
+                    res_tag = "2160p"
+                elif h >= 1440:
+                    tier = "2K QHD"
+                    res_tag = "1440p"
+                elif h >= 1080:
+                    tier = "Full HD"
+                    res_tag = "1080p"
+                elif h >= 720:
+                    tier = "HD"
+                    res_tag = "720p"
+                elif h >= 480:
+                    tier = "SD"
+                    res_tag = "480p"
+                elif h >= 360:
+                    tier = "Standard"
+                    res_tag = "360p"
+                elif h >= 240:
+                    tier = "Low"
+                    res_tag = "240p"
+                else:
+                    tier = "Ultra Low"
+                    res_tag = "144p"
+
+                if grp['dynamic_range'] != 'SDR':
+                    has_hdr = True
+
+                est_total = grp['max_filesize'] + best_audio_size if grp['max_filesize'] > 0 else 0
+                codec_list = sorted(list(grp['codecs']))
+
+                available_resolutions.append({
+                    'height': h,
+                    'width': grp['width'],
+                    'res_tag': res_tag,
+                    'tier_name': tier,
+                    'full_label': f"{res_tag} - {tier}",
+                    'fps': int(grp['max_fps']),
+                    'is_hdr': grp['dynamic_range'] != 'SDR',
+                    'dynamic_range': grp['dynamic_range'],
+                    'codecs': codec_list,
+                    'filesize_bytes': est_total,
+                    'filesize_str': format_bytes(est_total),
+                    'codec_note': "8K master stream in AV1/VP9 (YouTube standard)." if h >= 4320 else ("H.264 compatible." if "H.264" in codec_list else "AV1/VP9 streaming.")
+                })
+
             duration_sec = info.get('duration') or 0
-            if duration_sec >= 3600:
-                hours = int(duration_sec // 3600)
-                minutes = int((duration_sec % 3600) // 60)
-                seconds = int(duration_sec % 60)
-                duration_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            else:
-                minutes = int(duration_sec // 60)
-                seconds = int(duration_sec % 60)
-                duration_str = f"{minutes:02d}:{seconds:02d}"
+            duration_str = format_duration(duration_sec)
 
+            # Build quality options for UI
             quality_options = []
-            standard_resolutions = [1080, 720, 480, 360]
-            
             quality_options.append({
                 "id": "best",
-                "label": "Best Available (Max Quality)",
+                "label": f"Maximum Available ({available_resolutions[0]['res_tag'] if available_resolutions else 'Best'})",
                 "type": "video",
                 "format": "mp4",
                 "recommended": True,
@@ -93,169 +218,223 @@ def fetch_media_info(url: str) -> Dict[str, Any]:
                 "container": "mp4"
             })
 
-            for res in standard_resolutions:
-                if any(h >= res for h in sorted_heights):
-                    quality_options.append({
-                        "id": str(res),
-                        "label": f"{res}p HD" if res >= 720 else f"{res}p SD",
-                        "type": "video",
-                        "format": "mp4",
-                        "recommended": False,
-                        "resolution": f"{res}p",
-                        "container": "mp4"
-                    })
+            for r in available_resolutions:
+                quality_options.append({
+                    "id": str(r['height']),
+                    "label": r['full_label'],
+                    "type": "video",
+                    "format": "mp4",
+                    "recommended": False,
+                    "resolution": f"{r['height']}p",
+                    "codecs": r['codecs'],
+                    "filesize_str": r['filesize_str']
+                })
 
             quality_options.append({
                 "id": "mp3",
-                "label": "MP3 Audio Only (320 kbps)",
+                "label": "HQ Audio Only (MP3 320k)",
                 "type": "audio",
                 "format": "mp3",
                 "recommended": False,
-                "resolution": "320kbps",
+                "resolution": "Audio",
                 "container": "mp3"
             })
 
-            video_formats = [q for q in quality_options if q['type'] == 'video']
-            audio_formats = [q for q in quality_options if q['type'] == 'audio']
+            max_res_label = available_resolutions[0]['full_label'] if available_resolutions else "Best Quality"
 
             return {
-                "id": info.get("id"),
-                "title": info.get("title") or "Untitled Media",
-                "thumbnail": info.get("thumbnail"),
+                "title": info.get("title") or "Unknown Video",
+                "uploader": info.get("uploader") or info.get("channel") or "Unknown Creator",
                 "duration": duration_str,
                 "duration_seconds": duration_sec,
-                "uploader": info.get("uploader") or info.get("channel") or info.get("creator") or "Unknown Author",
-                "platform": platform,
+                "duration_formatted": duration_str,
+                "thumbnail": info.get("thumbnail"),
+                "platform": platform.capitalize(),
                 "webpage_url": info.get("webpage_url") or url,
-                "qualities": quality_options,
-                "formats": {
-                    "video": video_formats,
-                    "audio": audio_formats
-                }
+                "view_count": info.get("view_count"),
+                "has_8k": has_8k,
+                "has_4k": has_4k,
+                "has_hdr": has_hdr,
+                "max_resolution": max_res_label,
+                "resolutions": available_resolutions,
+                "all_codecs": sorted(list(all_codecs)),
+                "qualities": quality_options
             }
 
-    except yt_dlp.utils.DownloadError as e:
-        msg = str(e)
-        if "Private video" in msg:
-            raise ValueError("This video is private. Please provide a public video URL.")
-        elif "Sign in to confirm your age" in msg:
-            raise ValueError("This video requires age verification / login on the platform.")
-        elif "DRM" in msg:
-            raise ValueError("This video is DRM protected and cannot be processed.")
-        elif "Video unavailable" in msg:
-            raise ValueError("The video is unavailable or has been removed.")
-        else:
-            clean_msg = msg.split("ERROR:")[-1].strip()
-            raise ValueError(f"Platform error: {clean_msg}")
     except Exception as e:
-        logger.error(f"Error extracting video info: {e}")
-        raise ValueError(f"Failed to fetch video information: {str(e)}")
+        logger.error(f"Failed to fetch media info: {e}", exc_info=True)
+        raise ValueError(f"Could not extract video metadata: {str(e)}")
 
-def run_download_job(job_id: str, url: str, format_type: str, quality: str) -> None:
+def start_download(url: str, format_type: str = "video", quality: str = "best",
+                   height: Optional[int] = None, preferred_codec: str = "auto",
+                   container: str = "mp4", format_id: Optional[str] = None) -> str:
     """
-    Background worker that handles downloading, FFmpeg stream merging,
-    transcoding to H.264/AAC, and rigorous ffprobe verification.
+    Creates and initiates an asynchronous download worker.
     """
+    # Verify free disk space before queueing
+    disk_info = get_disk_free_space()
+    if disk_info["free_bytes"] < MIN_FREE_DISK_BYTES:
+        raise ValueError(f"Insufficient server disk space ({disk_info['free_gb']} GB free). Minimum 5 GB required.")
+
+    job_id = str(uuid.uuid4())
+    job_data = {
+        "job_id": job_id,
+        "task_id": job_id,
+        "url": url,
+        "format_type": format_type,
+        "quality": quality,
+        "height": height,
+        "preferred_codec": preferred_codec,
+        "container": container,
+        "format_id": format_id,
+        "status": "pending",
+        "progress": 0.0,
+        "percent": 0.0,
+        "downloaded_bytes": 0,
+        "downloaded_str": "0 KB",
+        "total_bytes": 0,
+        "total_str": "0 KB",
+        "speed_str": "--",
+        "eta_str": "--",
+        "message": "Download task queued...",
+        "phase_message": "Download task queued...",
+        "file_path": None,
+        "filename": None,
+        "file_size": 0,
+        "verification": None,
+        "verified_details": None,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "error": None,
+        "error_message": None
+    }
+
+    with jobs_lock:
+        jobs[job_id] = job_data
+
+    thread = threading.Thread(
+        target=_download_worker,
+        args=(job_id, url, format_type, quality, height, preferred_codec, container, format_id),
+        daemon=True
+    )
+    thread.start()
+    return job_id
+
+def _download_worker(job_id: str, url: str, format_type: str, quality: str,
+                     height: Optional[int], preferred_codec: str, container: str,
+                     format_id: Optional[str]) -> None:
     job_dir = DOWNLOADS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    
-    update_job(
-        job_id,
-        status="downloading",
-        percent=5.0,
-        progress=5.0,
-        message="Starting download and resolving streams..."
-    )
 
-    def progress_hook(d: Dict[str, Any]):
-        if d.get('status') == 'downloading':
+    update_job(job_id, status="analyzing", message="Resolving 8K/4K media streams...")
+
+    def progress_hook(d):
+        status = d.get('status')
+        if status == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
             downloaded = d.get('downloaded_bytes') or 0
             speed = d.get('speed') or 0
             eta = d.get('eta') or 0
 
-            pct = 10.0
+            percent = 0.0
             if total > 0:
-                pct = 10.0 + (downloaded / total) * 60.0
+                percent = min(99.0, (downloaded / total) * 100.0)
 
-            speed_str = f"{format_bytes(speed)}/s" if speed else ""
-            eta_str = f"{eta}s" if eta else ""
+            speed_s = f"{format_bytes(speed)}/s" if speed else "--"
+            eta_s = format_duration(eta) if eta else "--"
 
             update_job(
                 job_id,
-                percent=round(min(pct, 70.0), 1),
-                progress=round(min(pct, 70.0), 1),
-                speed_str=speed_str,
-                eta_str=eta_str,
-                message=f"Downloading media stream ({round(pct, 1)}%)..."
+                status="downloading",
+                progress=round(percent, 1),
+                percent=round(percent, 1),
+                downloaded_bytes=downloaded,
+                downloaded_str=format_bytes(downloaded),
+                total_bytes=total,
+                total_str=format_bytes(total),
+                speed_str=speed_s,
+                eta_str=eta_s,
+                message=f"Downloading: {percent:.1f}% ({format_bytes(downloaded)} of {format_bytes(total)})",
+                phase_message=f"Downloading: {percent:.1f}% ({format_bytes(downloaded)} of {format_bytes(total)})",
+                updated_at=time.time()
             )
-        elif d.get('status') == 'finished':
+        elif status == 'finished':
             update_job(
                 job_id,
-                percent=75.0,
-                progress=75.0,
                 status="merging",
-                message="Download stream completed. Merging audio & video..."
+                message="Lossless stream muxing with FFmpeg...",
+                phase_message="Lossless stream muxing with FFmpeg...",
+                updated_at=time.time()
             )
 
     try:
         is_video = (format_type == "video")
-        # Explicit intermediate file name to prevent FFmpeg in-place edit errors
-        temp_out_template = str((job_dir / f"stream_in_{job_id}.%(ext)s").resolve())
+        temp_out_template = str((job_dir / f"stream_{job_id}.%(ext)s").resolve())
 
+        # Determine target height
         q_cleaned = quality.replace("p", "").strip().lower()
+        target_h = height
+        if not target_h:
+            if "8k" in q_cleaned or "4320" in q_cleaned:
+                target_h = 4320
+            elif "4k" in q_cleaned or "2160" in q_cleaned:
+                target_h = 2160
+            elif "2k" in q_cleaned or "1440" in q_cleaned:
+                target_h = 1440
+            elif q_cleaned.isdigit():
+                target_h = int(q_cleaned)
 
         if is_video:
-            # Strictly select video + audio, never audio-only
-            if q_cleaned == "1080":
-                format_str = (
-                    "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-                    "bestvideo[height<=1080]+bestaudio/"
-                    "best[height<=1080]/"
-                    "bestvideo+bestaudio/best"
-                )
-            elif q_cleaned == "720":
-                format_str = (
-                    "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-                    "bestvideo[height<=720]+bestaudio/"
-                    "best[height<=720]/"
-                    "bestvideo+bestaudio/best"
-                )
-            elif q_cleaned == "480":
-                format_str = (
-                    "bestvideo[height<=480][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-                    "bestvideo[height<=480]+bestaudio/"
-                    "best[height<=480]/"
-                    "bestvideo+bestaudio/best"
-                )
-            elif q_cleaned == "360":
-                format_str = (
-                    "bestvideo[height<=360][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-                    "bestvideo[height<=360]+bestaudio/"
-                    "best[height<=360]/"
-                    "bestvideo+bestaudio/best"
-                )
-            else:  # "best"
-                format_str = (
-                    "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-                    "bestvideo+bestaudio/"
-                    "best"
-                )
+            # Format selector without restricting 8K to H.264
+            if format_id:
+                format_str = f"{format_id}+bestaudio/best"
+            elif target_h:
+                if preferred_codec == "av01":
+                    format_str = f"bestvideo[height<={target_h}][vcodec^=av01]+bestaudio/bestvideo[height<={target_h}]+bestaudio/best"
+                elif preferred_codec == "vp9":
+                    format_str = f"bestvideo[height<={target_h}][vcodec^=vp]+bestaudio/bestvideo[height<={target_h}]+bestaudio/best"
+                elif preferred_codec == "avc1":
+                    format_str = f"bestvideo[height<={target_h}][vcodec^=avc1]+bestaudio/bestvideo[height<={target_h}]+bestaudio/best"
+                else:
+                    format_str = f"bestvideo[height<={target_h}]+bestaudio/best[height<={target_h}]/best"
+            else:
+                # Highest available quality (up to 8K)
+                if preferred_codec == "av01":
+                    format_str = "bestvideo[vcodec^=av01]+bestaudio/bestvideo+bestaudio/best"
+                elif preferred_codec == "vp9":
+                    format_str = "bestvideo[vcodec^=vp]+bestaudio/bestvideo+bestaudio/best"
+                elif preferred_codec == "avc1":
+                    format_str = "bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best"
+                else:
+                    format_str = "bestvideo+bestaudio/best"
+
+            target_container = container.lower() if container else "mp4"
 
             ydl_opts = {
                 'format': format_str,
                 'outtmpl': temp_out_template,
-                'merge_output_format': 'mp4',
+                'merge_output_format': target_container,
                 'quiet': True,
                 'no_warnings': True,
-                'ffmpeg_location': FFMPEG_PATH,
                 'max_filesize': MAX_FILE_SIZE_BYTES,
                 'progress_hooks': [progress_hook],
-                'postprocessors': [{
-                    'key': 'FFmpegVideoConvertor',
-                    'preferedformat': 'mp4',
-                }]
+                'windowsfilenames': True,
             }
+
+            if FFMPEG_PATH:
+                ydl_opts['ffmpeg_location'] = os.path.dirname(FFMPEG_PATH) if os.path.isabs(FFMPEG_PATH) else None
+            if NODE_PATH:
+                ydl_opts['js_runtimes'] = {'node': {}}
+
+            # Lossless stream copying: preserves 100% video quality without CPU re-compression
+            if target_container == "mp4":
+                ydl_opts['postprocessor_args'] = {
+                    'merger': ['-c:v', 'copy', '-c:a', 'aac', '-b:a', '320k']
+                }
+            else:
+                ydl_opts['postprocessor_args'] = {
+                    'merger': ['-c', 'copy']
+                }
         else:
             # Audio MP3 download
             ydl_opts = {
@@ -263,7 +442,6 @@ def run_download_job(job_id: str, url: str, format_type: str, quality: str) -> N
                 'outtmpl': temp_out_template,
                 'quiet': True,
                 'no_warnings': True,
-                'ffmpeg_location': FFMPEG_PATH,
                 'max_filesize': MAX_FILE_SIZE_BYTES,
                 'progress_hooks': [progress_hook],
                 'postprocessors': [{
@@ -272,141 +450,76 @@ def run_download_job(job_id: str, url: str, format_type: str, quality: str) -> N
                     'preferredquality': '320',
                 }]
             }
+            if FFMPEG_PATH:
+                ydl_opts['ffmpeg_location'] = os.path.dirname(FFMPEG_PATH) if os.path.isabs(FFMPEG_PATH) else None
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             meta = ydl.extract_info(url, download=True)
             raw_title = meta.get("title") or "downloaded_file"
 
-        # Locate the downloaded file in job_dir
-        downloaded_files = list(job_dir.glob(f"stream_in_{job_id}.*"))
-        if not downloaded_files:
-            # fallback to any file not part
-            downloaded_files = [f for f in job_dir.glob("*") if not f.name.endswith(".part") and not f.name.endswith(".ytdl")]
+        # Locate output file
+        downloaded_candidates = [
+            f for f in job_dir.iterdir()
+            if f.is_file() and not f.name.endswith(".part") and not f.name.endswith(".ytdl")
+        ]
+        if not downloaded_candidates:
+            raise FileNotFoundError("Merged output file was not found after download.")
 
-        if not downloaded_files:
-            raise RuntimeError("No completed media file found after yt-dlp run.")
+        downloaded_file = max(downloaded_candidates, key=lambda f: f.stat().st_size)
 
-        raw_file = downloaded_files[0]
-        safe_title = sanitize_filename(raw_title)
-
-        if is_video:
-            update_job(
-                job_id,
-                percent=80.0,
-                progress=80.0,
-                status="converting",
-                message="Transcoding to device-compatible H.264/AAC MP4..."
-            )
-            final_filename = f"{safe_title}.mp4"
-            final_path = job_dir / final_filename
-
-            # If input file is different from output, transcode/remux cleanly
-            if raw_file.resolve() == final_path.resolve():
-                temp_renamed = job_dir / f"temp_{job_id}.mp4"
-                raw_file.rename(temp_renamed)
-                raw_file = temp_renamed
-
-            ensure_compatible_mp4(raw_file, final_path)
-            
-            if raw_file.exists():
-                try:
-                    raw_file.unlink()
-                except Exception:
-                    pass
-
-            update_job(
-                job_id,
-                percent=92.0,
-                progress=92.0,
-                status="converting",
-                message="Running ffprobe stream verification (checking video & audio tracks)..."
-            )
-
-            verification = verify_media_file(final_path, expected_type="video")
-
-        else:
-            update_job(
-                job_id,
-                percent=85.0,
-                progress=85.0,
-                status="converting",
-                message="Verifying audio stream..."
-            )
-            final_filename = f"{safe_title}.mp3"
-            final_path = job_dir / final_filename
-            
-            if raw_file.resolve() != final_path.resolve():
-                if final_path.exists():
-                    final_path.unlink()
-                raw_file.rename(final_path)
-
-            verification = verify_media_file(final_path, expected_type="audio")
-
-        # Success!
+        # Verification Step via FFprobe
         update_job(
             job_id,
-            status="finished",
-            state="completed",
-            percent=100.0,
+            status="verifying",
+            message="Verifying playable video and audio streams with FFprobe...",
+            phase_message="Verifying playable video and audio streams with FFprobe..."
+        )
+
+        verification_result = verify_media_file(downloaded_file, expected_type=format_type)
+
+        safe_name = sanitize_filename(raw_title)
+        ext = downloaded_file.suffix or (".mp4" if is_video else ".mp3")
+        final_filename = f"{safe_name}{ext}"
+        final_filepath = job_dir / final_filename
+
+        if final_filepath != downloaded_file:
+            if final_filepath.exists():
+                final_filepath.unlink()
+            downloaded_file.rename(final_filepath)
+
+        final_size = final_filepath.stat().st_size
+        verification_result["size_bytes"] = final_size
+
+        update_job(
+            job_id,
+            status="completed",
             progress=100.0,
-            message="Ready! Video & audio streams verified successfully.",
-            file_path=str(final_path),
+            percent=100.0,
+            file_path=str(final_filepath.resolve()),
             filename=final_filename,
-            file_size=final_path.stat().st_size,
-            file_size_formatted=format_bytes(final_path.stat().st_size),
-            download_url=f"/api/file/{job_id}",
-            preview_url=f"/api/preview/{job_id}",
-            verification=verification
+            file_size=final_size,
+            file_size_str=format_bytes(final_size),
+            title=raw_title,
+            verification=verification_result,
+            verified_details=verification_result,
+            message=f"Download verified successfully! ({verification_result.get('resolution', '')})",
+            phase_message=f"Download verified successfully! ({verification_result.get('resolution', '')})"
         )
 
-    except VerificationError as ve:
-        logger.error(f"Verification error in job {job_id}: {ve}")
-        update_job(
-            job_id,
-            status="error",
-            state="failed",
-            error=str(ve),
-            message="Verification failed: Output file missing required video/audio tracks."
-        )
     except Exception as e:
-        logger.exception(f"Download job {job_id} failed: {e}")
+        logger.error(f"Download worker error for job {job_id}: {e}", exc_info=True)
         update_job(
             job_id,
-            status="error",
-            state="failed",
+            status="failed",
             error=str(e),
-            message=f"Download failed: {str(e)}"
+            error_message=str(e),
+            message=f"Error: {str(e)}",
+            phase_message=f"Error: {str(e)}"
         )
-
-def start_download(url: str, format_type: str, quality: str) -> str:
-    """
-    Creates a job and launches the background download thread.
-    """
-    job_id = str(uuid.uuid4())
-    with jobs_lock:
-        jobs[job_id] = {
-            "job_id": job_id,
-            "task_id": job_id,
-            "url": url,
-            "format_type": format_type,
-            "quality": quality,
-            "status": "queued",
-            "state": "pending",
-            "percent": 0.0,
-            "progress": 0.0,
-            "speed_str": "",
-            "eta_str": "",
-            "message": "Initializing download task...",
-            "created_at": time.time(),
-            "download_url": f"/api/file/{job_id}",
-            "preview_url": f"/api/preview/{job_id}",
-            "error": None
-        }
-
-    thread = threading.Thread(
-        target=run_download_job,
-        args=(job_id, url, format_type, quality),
-        daemon=True
-    )
-    thread.start()
-    return job_id
+        # Clean up partial files
+        try:
+            for f in job_dir.iterdir():
+                if f.name.endswith(".part") or f.name.endswith(".ytdl"):
+                    f.unlink()
+        except Exception:
+            pass

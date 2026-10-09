@@ -1,17 +1,18 @@
 import os
+import re
 import json
 import time
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.security import validate_url, sanitize_filename
 from app.downloader import fetch_media_info, start_download, get_job, jobs
-from app.config import DOWNLOADS_DIR, FFMPEG_PATH, FFPROBE_PATH
+from app.config import DOWNLOADS_DIR, FFMPEG_PATH, FFPROBE_PATH, get_disk_free_space
 
 router = APIRouter(prefix="/api")
 
@@ -30,7 +31,7 @@ def save_history(history: List[Dict[str, Any]]) -> None:
     try:
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2, ensure_ascii=False)
-    except Exception as e:
+    except Exception:
         pass
 
 def add_to_history(task_id: str, title: str, url: str, format_type: str, quality: str, thumbnail: Optional[str] = None):
@@ -55,7 +56,9 @@ class DownloadRequest(BaseModel):
     url: str
     format_type: str = "video"
     quality: Optional[str] = "best"
+    height: Optional[int] = None
     format_id: Optional[str] = None
+    preferred_codec: Optional[str] = "auto"
     container: Optional[str] = "mp4"
     title: Optional[str] = None
     thumbnail: Optional[str] = None
@@ -64,12 +67,16 @@ class DownloadRequest(BaseModel):
 def health_check():
     ffmpeg_ok = bool(shutil.which(FFMPEG_PATH))
     ffprobe_ok = bool(shutil.which(FFPROBE_PATH))
+    disk = get_disk_free_space()
+    import yt_dlp
     return {
         "status": "healthy",
         "online": True,
         "healthy": ffmpeg_ok and ffprobe_ok,
         "ffmpeg_available": ffmpeg_ok,
-        "ffprobe_available": ffprobe_ok
+        "ffprobe_available": ffprobe_ok,
+        "yt_dlp_version": yt_dlp.version.__version__,
+        "disk": disk
     }
 
 @router.post("/info")
@@ -82,7 +89,11 @@ def analyze_endpoint(req: UrlRequest):
 
     try:
         info = fetch_media_info(url)
-        return info
+        return {
+            "success": True,
+            "data": info,
+            **info
+        }
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
@@ -102,7 +113,11 @@ def download_endpoint(req: DownloadRequest):
     task_id = start_download(
         url=url,
         format_type=req.format_type,
-        quality=quality_to_use
+        quality=quality_to_use,
+        height=req.height,
+        preferred_codec=req.preferred_codec or "auto",
+        container=req.container or "mp4",
+        format_id=req.format_id
     )
 
     add_to_history(
@@ -118,6 +133,7 @@ def download_endpoint(req: DownloadRequest):
         "success": True,
         "task_id": task_id,
         "job_id": task_id,
+        "status": "pending",
         "message": "Download task queued successfully."
     }
 
@@ -129,7 +145,10 @@ def progress_endpoint(task_id: str):
     return job
 
 @router.get("/file/{task_id}")
-def file_endpoint(task_id: str):
+async def file_endpoint(task_id: str, request: Request):
+    """
+    Serves completed video with HTTP Range header support for large 4K/8K safe streaming.
+    """
     job = get_job(task_id)
     if not job:
         raise HTTPException(status_code=404, detail="Task not found or expired.")
@@ -145,14 +164,49 @@ def file_endpoint(task_id: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found on disk.")
 
-    media_type = "video/mp4" if job.get("format_type") == "video" else "audio/mpeg"
+    file_size = file_path.stat().st_size
     filename = job.get("filename", file_path.name)
+    safe_filename = re.sub(r'[^\w\-_\. ]', '_', filename)
+
+    media_type = "video/mp4" if job.get("format_type") == "video" else "audio/mpeg"
+    if filename.endswith(".mkv"):
+        media_type = "video/x-matroska"
+
+    range_header = request.headers.get("Range")
+    if range_header:
+        bytes_match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if bytes_match:
+            start = int(bytes_match.group(1))
+            end = int(bytes_match.group(2)) if bytes_match.group(2) else file_size - 1
+            start = min(start, file_size - 1)
+            end = min(end, file_size - 1)
+            chunk_length = end - start + 1
+
+            def iter_chunk():
+                with open(file_path, "rb") as f:
+                    f.seek(start)
+                    bytes_remaining = chunk_length
+                    while bytes_remaining > 0:
+                        chunk_size = min(bytes_remaining, 1024 * 1024)
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        bytes_remaining -= len(chunk)
+                        yield chunk
+
+            headers = {
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(chunk_length),
+                "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            }
+            return StreamingResponse(iter_chunk(), status_code=206, headers=headers, media_type=media_type)
 
     return FileResponse(
         path=str(file_path),
-        filename=filename,
+        filename=safe_filename,
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        headers={"Accept-Ranges": "bytes", "Content-Disposition": f'attachment; filename="{safe_filename}"'}
     )
 
 @router.get("/preview/{task_id}")
@@ -173,11 +227,13 @@ def preview_endpoint(task_id: str):
         raise HTTPException(status_code=404, detail="File not found on disk.")
 
     media_type = "video/mp4" if job.get("format_type") == "video" else "audio/mpeg"
+    if file_path.name.endswith(".mkv"):
+        media_type = "video/x-matroska"
 
     return FileResponse(
         path=str(file_path),
         media_type=media_type,
-        headers={"Content-Disposition": 'inline'}
+        headers={"Content-Disposition": 'inline', "Accept-Ranges": "bytes"}
     )
 
 @router.get("/history")
